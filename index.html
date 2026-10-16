@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Meeting Recorder</title>
+<!--
+  Meeting Recorder: transcribes what it hears and sends the text to a Google Sheet
+  through a small Apps Script (see meetingNotes.gs and README.md).
+
+  Nothing private lives in this file. The web app URL and secret are typed into the
+  page once per device and remembered only in that device's browser.
+-->
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #fff; --text: #222; --muted: #5f6368; --line: #d0d4da;
+    --blue: #1a73e8; --red: #d93025; --green: #188038;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17191c; --card: #22252a; --text: #e8eaed; --muted: #9aa0a6; --line: #3c4043;
+            --blue: #8ab4f8; --red: #f28b82; --green: #81c995; }
+  }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 0; padding: 16px;
+         background: var(--bg); color: var(--text); }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .link { background: none; border: 0; color: var(--blue); font: inherit; font-size: 14px; cursor: pointer; padding: 6px 0; }
+
+  .row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  #toggle { font: 600 16px Arial, sans-serif; padding: 14px 24px; border: 0; border-radius: 10px; cursor: pointer;
+            color: #fff; background: #1a73e8; min-width: 200px; }
+  #toggle.live { background: #d93025; }
+  #toggle:disabled { opacity: .5; cursor: default; }
+  #status { font-size: 13px; color: var(--muted); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #bbb; margin-right: 6px; vertical-align: -1px; }
+  .dot.live { background: #d93025; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  textarea { width: 100%; height: 60vh; min-height: 220px; font: 15px/1.5 Arial, sans-serif; padding: 12px;
+             border: 1px solid var(--line); border-radius: 10px; resize: vertical; background: var(--card); color: var(--text); }
+  #interim { color: var(--muted); font-style: italic; min-height: 1.5em; font-size: 14px; margin-top: 4px; }
+  #msg { font-size: 14px; margin-top: 6px; min-height: 1.2em; }
+  .ok { color: var(--green); } .err { color: var(--red); }
+
+  #settings { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  #settings h2 { font-size: 15px; margin: 0 0 4px; }
+  #settings p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
+  input[type=text], input[type=password] { width: 100%; font: 14px Arial, sans-serif; padding: 10px; border: 1px solid var(--line);
+             border-radius: 8px; background: var(--bg); color: var(--text); }
+  .small { font-size: 13px; color: var(--muted); font-weight: 400; display: inline-flex; gap: 6px; align-items: center; margin-top: 6px; }
+  .btn { font: 600 14px Arial, sans-serif; padding: 10px 18px; border: 0; border-radius: 8px; cursor: pointer; background: #1a73e8; color: #fff; }
+  .btn.plain { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  #settingsMsg { font-size: 13px; margin-top: 10px; min-height: 1.2em; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Meeting Recorder</h1>
+    <button class="link" id="openSettings">⚙ Settings</button>
+  </header>
+
+  <section id="settings" hidden>
+    <h2>Connect this device to your sheet</h2>
+    <p>These two things are saved only in this browser on this device. They're never part of the page's code.</p>
+
+    <label for="urlInput">Web app URL <span class="small">(Apps Script › Deploy › Manage deployments, ends in /exec)</span></label>
+    <input type="text" id="urlInput" placeholder="https://script.google.com/…/exec" autocomplete="off" autocapitalize="off" spellcheck="false">
+
+    <label for="secretInput">Secret <span class="small">(same as the SECRET script property)</span></label>
+    <input type="password" id="secretInput" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <label class="small"><input type="checkbox" id="showSecret"> Show secret</label>
+
+    <div class="row" style="margin:14px 0 0">
+      <button class="btn" id="saveSettings">Save &amp; test</button>
+      <button class="btn plain" id="closeSettings">Close</button>
+      <button class="link" id="forget">Forget on this device</button>
+    </div>
+    <div id="settingsMsg"></div>
+  </section>
+
+  <div class="row">
+    <button id="toggle">● Start recording</button>
+    <span id="status"><span class="dot" id="dot"></span><span id="statusText">Idle</span></span>
+  </div>
+
+  <textarea id="text" placeholder="Transcript appears here as you talk. You can fix words in this box before you end the recording."></textarea>
+  <div id="interim"></div>
+  <div id="msg"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  // iPhone and iPad (iPadOS reports itself as a Mac, so also check for a touch screen)
+  const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                 (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  const $ = id => document.getElementById(id);
+  const box = $('text'), interimEl = $('interim'), msg = $('msg'), dot = $('dot'), statusText = $('statusText'), btn = $('toggle');
+
+  // ---------- small storage helpers (storage can be unavailable in private windows) ----------
+  function getItem(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function setItem(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function removeItem(k) { try { localStorage.removeItem(k); } catch (e) {} }
+
+  // ---------- settings: web app URL + secret, kept on this device only ----------
+  const KEY_URL = 'mr_url', KEY_SECRET = 'mr_secret', KEY_DRAFT = 'mr_draft';
+  function settings() { return { url: getItem(KEY_URL), secret: getItem(KEY_SECRET) }; }
+  function isConfigured() { const s = settings(); return /\/exec\/?$/.test(s.url) && s.secret !== ''; }
+
+  function showSettings(note, cls) {
+    const s = settings();
+    $('urlInput').value = s.url;
+    $('secretInput').value = s.secret;
+    $('settingsMsg').textContent = note || '';
+    $('settingsMsg').className = cls || '';
+    $('settings').hidden = false;
+  }
+  function hideSettings() { $('settings').hidden = true; }
+
+  $('openSettings').onclick = () => $('settings').hidden ? showSettings() : hideSettings();
+  $('closeSettings').onclick = hideSettings;
+  $('showSecret').onchange = e => { $('secretInput').type = e.target.checked ? 'text' : 'password'; };
+
+  $('forget').onclick = () => {
+    if (!confirm('Remove the web app URL and secret from this device?')) return;
+    removeItem(KEY_URL); removeItem(KEY_SECRET);
+    showSettings('Removed from this device.', 'ok');
+  };
+
+  $('saveSettings').onclick = async () => {
+    const url = $('urlInput').value.trim();
+    const secret = $('secretInput').value.trim();
+    const out = $('settingsMsg');
+    if (!/^https:\/\/script\.google\.com\/.+\/exec\/?$/.test(url)) {
+      out.textContent = 'That URL doesn\'t look right. It should start with https://script.google.com/ and end in /exec.';
+      out.className = 'err'; return;
+    }
+    if (!secret) { out.textContent = 'Enter the secret too.'; out.className = 'err'; return; }
+    setItem(KEY_URL, url); setItem(KEY_SECRET, secret);
+    out.textContent = 'Saved. Testing the connection…'; out.className = '';
+    try {
+      const res = await post({ secret: secret, ping: true });
+      out.textContent = res.ok ? 'Connected. You\'re ready to record.' : res.message;
+      out.className = res.ok ? 'ok' : 'err';
+      if (res.ok) setTimeout(hideSettings, 1200);
+    } catch (e) {
+      out.textContent = e.message; out.className = 'err';
+    }
+  };
+
+  // Sends JSON to the Apps Script web app and returns its JSON reply.
+  async function post(payload) {
+    let res;
+    try {
+      res = await fetch(settings().url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // plain text avoids a CORS preflight
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      throw new Error('Could not reach the script (' + e.message + '). Check your connection and the web app URL.');
+    }
+    try { return await res.json(); }
+    catch (e) { throw new Error('The script didn\'t answer as expected. Check the web app URL, and that the deployment\'s access is set to "Anyone".'); }
+  }
+
+  // ---------- draft: keeps the text if the page crashes or is closed by accident ----------
+  box.value = getItem(KEY_DRAFT);
+  box.addEventListener('input', saveDraft);
+  function saveDraft() { setItem(KEY_DRAFT, box.value); }
+
+  function setStatus(t, live) { statusText.textContent = t; dot.className = 'dot' + (live ? ' live' : ''); }
+  function say(t, cls) { msg.textContent = t; msg.className = cls || ''; }
+
+  // ---------- keep the screen on while recording (phones and tablets) ----------
+  let wakeLock = null;
+  async function keepAwake(on) {
+    try {
+      if (on && 'wakeLock' in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } else if (!on && wakeLock) {
+        const w = wakeLock; wakeLock = null; await w.release();
+      }
+    } catch (e) { /* not supported or not allowed; recording still works */ }
+  }
+
+  // ---------- speech recognition ----------
+  let rec = null, listening = false, active = false, restartTimer = null, finishTimer = null;
+  let pendingInterim = '', lastActivity = 0, watchdog = null, failedRestarts = 0;
+
+  function append(t) {
+    t = t.trim();
+    if (!t) return;
+    const sep = box.value && !/\s$/.test(box.value) ? ' ' : '';
+    box.value += sep + t;
+    saveDraft();
+    box.scrollTop = box.scrollHeight;
+  }
+  // Keep whatever is still in the grey "deciding" line rather than losing it.
+  function commitInterim() {
+    if (pendingInterim.trim()) append(pendingInterim);
+    pendingInterim = '';
+    interimEl.textContent = '';
+  }
+
+  function makeRecognizer() {
+    const r = new SR();
+    r.lang = 'en-US';
+    r.interimResults = true;
+    // Chrome handles one long session well. Safari on iPhone/iPad is more reliable
+    // in short bursts that restart automatically.
+    r.continuous = !IS_IOS;
+
+    r.onstart = () => { active = true; failedRestarts = 0; lastActivity = Date.now(); };
+
+    r.onresult = e => {
+      lastActivity = Date.now();
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) append(t);
+        else interim += t;
+      }
+      pendingInterim = interim;
+      interimEl.textContent = interim;
+    };
+
+    r.onerror = e => {
+      lastActivity = Date.now();
+      if (e.error === 'not-allowed') {
+        say(IS_IOS
+          ? 'Microphone access was blocked. Tap "aA" in the address bar › Website Settings › Microphone › Allow, then reload.'
+          : 'Microphone access was blocked. Click the icon left of the address bar, allow Microphone, then reload.', 'err');
+        stopNow();
+      } else if (e.error === 'service-not-allowed') {
+        say(IS_IOS
+          ? 'Speech recognition is off on this device. Turn on Settings › General › Keyboard › Enable Dictation, then reload.'
+          : 'Speech recognition was blocked by the browser. Try reloading, or use Google Chrome.', 'err');
+        stopNow();
+      } else if (e.error === 'audio-capture') {
+        say('No microphone was found. Check that one is connected and not in use by another app.', 'err');
+        stopNow();
+      } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+        say('Recognizer hiccup (' + e.error + '), restarting.', '');
+      }
+    };
+
+    // Recognition ends after silence, after each burst on iPhone/iPad, or every few minutes in Chrome.
+    // While we're meant to be recording, start it again.
+    r.onend = () => {
+      active = false;
+      commitInterim();
+      if (listening) restartTimer = setTimeout(restart, IS_IOS ? 150 : 300);
+    };
+    return r;
+  }
+
+  function restart() {
+    if (!listening) return;
+    try { rec.start(); }
+    catch (e) {
+      failedRestarts++;
+      if (failedRestarts > 5) { rec = makeRecognizer(); failedRestarts = 0; }
+      restartTimer = setTimeout(restart, 500);
+    }
+  }
+
+  function startRecording() {
+    if (!isConfigured()) { showSettings('Connect this device to your sheet first.', 'err'); return; }
+    listening = true;
+    rec = makeRecognizer();
+    try { rec.start(); } catch (e) {}
+    btn.textContent = '■ End recording';
+    btn.className = 'live';
+    setStatus(IS_IOS ? 'Recording. Keep this page open and the screen on.' : 'Recording. Keep this window open and the mic unmuted.', true);
+    say('');
+    keepAwake(true);
+    // Safari can occasionally freeze the recognizer; if nothing happens for a while, kick it.
+    lastActivity = Date.now();
+    clearInterval(watchdog);
+    watchdog = setInterval(() => {
+      if (listening && active && Date.now() - lastActivity > 30000) {
+        lastActivity = Date.now();
+        try { rec.abort(); } catch (e) {}
+      }
+    }, 5000);
+  }
+
+  function resetButton() {
+    btn.textContent = '● Start recording';
+    btn.className = '';
+    btn.disabled = false;
+    setStatus('Idle', false);
+  }
+
+  // Stop without saving (used when something blocks the mic).
+  function stopNow() {
+    listening = false;
+    clearTimeout(restartTimer); clearInterval(watchdog);
+    if (rec) { rec.onend = null; try { rec.abort(); } catch (e) {} }
+    active = false;
+    commitInterim();
+    resetButton();
+    keepAwake(false);
+  }
+
+  // End: let the recognizer hand over its last words, then save.
+  function endRecording() {
+    listening = false;
+    clearTimeout(restartTimer); clearInterval(watchdog);
+    btn.disabled = true;
+    setStatus('Finishing the last few words…', true);
+
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(finishTimer);
+      active = false;
+      if (rec) { rec.onend = null; rec.onresult = null; rec.onerror = null; }
+      commitInterim();
+      resetButton();
+      keepAwake(false);
+      save();
+    };
+
+    if (rec && active) {
+      rec.onend = finish;
+      try { rec.stop(); } catch (e) { finish(); return; }
+      finishTimer = setTimeout(() => { try { rec.abort(); } catch (e) {} finish(); }, 2500);
+    } else {
+      finish();
+    }
+  }
+
+  async function save() {
+    const text = box.value.trim();
+    if (!text) { say('Nothing was transcribed, so nothing was saved.', 'err'); return; }
+    if (!isConfigured()) { showSettings('Connect this device to your sheet, then click Start and End again to save.', 'err'); return; }
+    say('Saving…');
+    btn.disabled = true;
+    try {
+      const out = await post({ secret: settings().secret, text: text });
+      if (out.ok) {
+        say(out.message, 'ok');
+        box.value = '';
+        saveDraft();
+      } else {
+        say(out.message + ' Your text is still here.', 'err');
+      }
+    } catch (e) {
+      say(e.message + ' Your text is still here; click Start, then End, to try again.', 'err');
+    }
+    btn.disabled = false;
+  }
+
+  btn.onclick = () => listening ? endRecording() : startRecording();
+
+  // Coming back to the page on a phone: ask to keep the screen on again.
+  document.addEventListener('visibilitychange', () => {
+    if (listening && document.visibilityState === 'visible') keepAwake(true);
+  });
+
+  window.addEventListener('beforeunload', e => {
+    if (listening || box.value.trim()) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  // ---------- first load ----------
+  if (!SR) {
+    say(IS_IOS
+      ? 'Speech recognition isn\'t available in this browser. On iPhone or iPad, open this page in Safari.'
+      : 'Speech recognition isn\'t available in this browser. Open this page in Google Chrome.', 'err');
+    btn.disabled = true;
+  }
+  if (!isConfigured()) showSettings();
+})();
+</script>
+</body>
+</html>
