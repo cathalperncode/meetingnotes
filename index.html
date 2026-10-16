@@ -54,6 +54,9 @@
   .small { font-size: 13px; color: var(--muted); font-weight: 400; display: inline-flex; gap: 6px; align-items: center; margin-top: 6px; }
   .btn { font: 600 14px Arial, sans-serif; padding: 10px 18px; border: 0; border-radius: 8px; cursor: pointer; background: #1a73e8; color: #fff; }
   .btn.plain { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  .btn.green { background: #188038; margin-top: 8px; }
+  a.btn { display: inline-block; text-decoration: none; }
+  .btn:disabled { opacity: .5; cursor: default; }
   #settingsMsg { font-size: 13px; margin-top: 10px; min-height: 1.2em; }
   [hidden] { display: none !important; }
 </style>
@@ -89,9 +92,11 @@
     <span id="status"><span class="dot" id="dot"></span><span id="statusText">Idle</span></span>
   </div>
 
-  <textarea id="text" placeholder="Transcript appears here as you talk. You can fix words in this box before you end the recording."></textarea>
+  <textarea id="text" placeholder="Transcript appears here as you talk. You can fix words before you end the recording, or paste in text from somewhere else and save it."></textarea>
   <div id="interim"></div>
+  <button class="btn green" id="saveText" hidden>Save this text to sheet</button>
   <div id="msg"></div>
+  <a class="btn green" id="thenLink" hidden></a>
 </div>
 
 <script>
@@ -102,9 +107,22 @@
   // iPhone and iPad (iPadOS reports itself as a Mac, so also check for a touch screen)
   const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const IS_MOBILE = IS_IOS || /Android/i.test(navigator.userAgent);
 
   const $ = id => document.getElementById(id);
   const box = $('text'), interimEl = $('interim'), msg = $('msg'), dot = $('dot'), statusText = $('statusText'), btn = $('toggle');
+  const saveTextBtn = $('saveText');
+
+  // ---------- optional: run an iPhone/iPad Shortcut after saving ----------
+  // Open the page as  …/?meeting  to run a Shortcut named "Meeting over" after each save,
+  // or  …/?then=Any%20Name  for a Shortcut with a different name.
+  const params = new URLSearchParams(location.search);
+  const THEN_SHORTCUT = (params.has('meeting') ? 'Meeting over' : (params.get('then') || '')).trim().slice(0, 60);
+  const thenLink = $('thenLink');
+  if (THEN_SHORTCUT) {
+    thenLink.href = 'shortcuts://run-shortcut?name=' + encodeURIComponent(THEN_SHORTCUT);
+    thenLink.textContent = 'Run "' + THEN_SHORTCUT + '" shortcut';
+  }
 
   // ---------- small storage helpers (storage can be unavailable in private windows) ----------
   function getItem(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
@@ -176,7 +194,12 @@
   // ---------- draft: keeps the text if the page crashes or is closed by accident ----------
   box.value = getItem(KEY_DRAFT);
   box.addEventListener('input', saveDraft);
-  function saveDraft() { setItem(KEY_DRAFT, box.value); }
+  function saveDraft() { setItem(KEY_DRAFT, box.value); refreshSaveText(); }
+
+  // "Save this text to sheet" shows only when you're not recording and the box has text,
+  // e.g. after pasting a transcript from Voice Memos.
+  function refreshSaveText() { saveTextBtn.hidden = listening || !box.value.trim(); }
+  saveTextBtn.onclick = () => save();
 
   function setStatus(t, live) { statusText.textContent = t; dot.className = 'dot' + (live ? ' live' : ''); }
   function say(t, cls) { msg.textContent = t; msg.className = cls || ''; }
@@ -278,6 +301,8 @@
   function startRecording() {
     if (!isConfigured()) { showSettings('Connect this device to your sheet first.', 'err'); return; }
     listening = true;
+    refreshSaveText();
+    thenLink.hidden = true;
     rec = makeRecognizer();
     try { rec.start(); } catch (e) {}
     btn.textContent = '■ End recording';
@@ -301,6 +326,7 @@
     btn.className = '';
     btn.disabled = false;
     setStatus('Idle', false);
+    refreshSaveText();
   }
 
   // Stop without saving (used when something blocks the mic).
@@ -346,29 +372,54 @@
   async function save() {
     const text = box.value.trim();
     if (!text) { say('Nothing was transcribed, so nothing was saved.', 'err'); return; }
-    if (!isConfigured()) { showSettings('Connect this device to your sheet, then click Start and End again to save.', 'err'); return; }
+    if (!isConfigured()) { showSettings('Connect this device to your sheet, then tap "Save this text to sheet".', 'err'); return; }
     say('Saving…');
     btn.disabled = true;
+    saveTextBtn.disabled = true;
     try {
       const out = await post({ secret: settings().secret, text: text });
       if (out.ok) {
         say(out.message, 'ok');
         box.value = '';
         saveDraft();
+        if (THEN_SHORTCUT) {
+          // The link stays on screen in case the switch is blocked (for example, still in Guided Access).
+          say(out.message + ' Switching to your "' + THEN_SHORTCUT + '" shortcut…', 'ok');
+          thenLink.hidden = false;
+          setTimeout(() => { window.location.href = thenLink.href; }, 800);
+        }
       } else {
         say(out.message + ' Your text is still here.', 'err');
       }
     } catch (e) {
-      say(e.message + ' Your text is still here; click Start, then End, to try again.', 'err');
+      say(e.message + ' Your text is still here; tap "Save this text to sheet" to try again.', 'err');
     }
     btn.disabled = false;
+    saveTextBtn.disabled = false;
+    refreshSaveText();
   }
 
   btn.onclick = () => listening ? endRecording() : startRecording();
 
   // Coming back to the page on a phone: ask to keep the screen on again.
+  // Phones pause the mic while the screen is locked or another app is open, and the
+  // recognizer doesn't always wake back up on its own. When the page comes back,
+  // start a fresh one and say there's a gap.
+  let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
-    if (listening && document.visibilityState === 'visible') keepAwake(true);
+    if (!listening) return;
+    if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
+    keepAwake(true);
+    if (!IS_MOBILE || !hiddenAt) return;
+    const away = Math.round((Date.now() - hiddenAt) / 1000);
+    hiddenAt = 0;
+    clearTimeout(restartTimer);
+    if (rec) { rec.onend = null; try { rec.abort(); } catch (e) {} }
+    active = false;
+    commitInterim();
+    rec = makeRecognizer();
+    restartTimer = setTimeout(restart, 300);
+    if (away >= 3) say('Recording resumed. The ' + away + ' seconds while the screen was off or you were in another app weren\'t captured.', 'err');
   });
 
   window.addEventListener('beforeunload', e => {
@@ -376,6 +427,7 @@
   });
 
   // ---------- first load ----------
+  refreshSaveText();
   if (!SR) {
     say(IS_IOS
       ? 'Speech recognition isn\'t available in this browser. On iPhone or iPad, open this page in Safari.'
